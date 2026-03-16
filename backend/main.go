@@ -63,6 +63,23 @@ type CheckIssue struct {
 	CreatedAt     string `json:"created_at"`
 }
 
+type ExpectedDoc struct {
+	ID              int64  `json:"id"`
+	DocID           string `json:"doc_id"`
+	Title           string `json:"title"`
+	Category        string `json:"category"`
+	PublishDate     string `json:"publish_date"`
+	ExpectedURL     string `json:"expected_url"`
+	FileSHA256      string `json:"file_sha256"`
+	FileSize        int64  `json:"file_size"`
+	Version         string `json:"version"`
+	Status          string `json:"status"`
+	PublishDeadline string `json:"publish_deadline"`
+	Remark          string `json:"remark"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
 type DashboardStats struct {
 	TotalDocs    int          `json:"total_docs"`
 	TotalRuns    int          `json:"total_runs"`
@@ -148,10 +165,29 @@ func initDB() {
 		FOREIGN KEY (run_id) REFERENCES check_runs(id)
 	);
 
+	CREATE TABLE IF NOT EXISTS expected_docs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		doc_id TEXT NOT NULL DEFAULT '',
+		title TEXT NOT NULL,
+		category TEXT NOT NULL,
+		publish_date TEXT NOT NULL DEFAULT '',
+		expected_url TEXT DEFAULT '',
+		file_sha256 TEXT DEFAULT '',
+		file_size INTEGER DEFAULT 0,
+		version TEXT DEFAULT '',
+		status TEXT DEFAULT 'approved',
+		publish_deadline TEXT DEFAULT '',
+		remark TEXT DEFAULT '',
+		created_at TEXT DEFAULT (datetime('now')),
+		updated_at TEXT DEFAULT (datetime('now'))
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_docs_category ON disclosure_docs(category);
 	CREATE INDEX IF NOT EXISTS idx_docs_date ON disclosure_docs(publish_date);
 	CREATE INDEX IF NOT EXISTS idx_issues_run ON check_issues(run_id);
 	CREATE INDEX IF NOT EXISTS idx_issues_resolved ON check_issues(resolved);
+	CREATE INDEX IF NOT EXISTS idx_expected_category ON expected_docs(category);
+	CREATE INDEX IF NOT EXISTS idx_expected_status ON expected_docs(status);
 	`
 	_, err = db.Exec(schema)
 	if err != nil {
@@ -631,6 +667,161 @@ func handleCategories(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, categories)
 }
 
+// ============== Expected Docs (Source of Truth) ==============
+
+func handleExpectedDocs(w http.ResponseWriter, r *http.Request) {
+	category := r.URL.Query().Get("category")
+	status := r.URL.Query().Get("status")
+
+	query := `SELECT id, doc_id, title, category, publish_date, expected_url, file_sha256,
+		file_size, version, status, publish_deadline, remark, created_at, updated_at
+		FROM expected_docs WHERE 1=1`
+	var args []interface{}
+
+	if category != "" {
+		query += " AND category=?"
+		args = append(args, category)
+	}
+	if status != "" {
+		query += " AND status=?"
+		args = append(args, status)
+	}
+	query += " ORDER BY updated_at DESC"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+
+	var docs []ExpectedDoc
+	for rows.Next() {
+		var d ExpectedDoc
+		rows.Scan(&d.ID, &d.DocID, &d.Title, &d.Category, &d.PublishDate, &d.ExpectedURL,
+			&d.FileSHA256, &d.FileSize, &d.Version, &d.Status, &d.PublishDeadline,
+			&d.Remark, &d.CreatedAt, &d.UpdatedAt)
+		docs = append(docs, d)
+	}
+	jsonResponse(w, docs)
+}
+
+func handleCreateExpectedDoc(w http.ResponseWriter, r *http.Request) {
+	var d ExpectedDoc
+	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		http.Error(w, "Invalid request body", 400)
+		return
+	}
+	if d.Title == "" || d.Category == "" {
+		http.Error(w, "title and category are required", 400)
+		return
+	}
+	if d.Status == "" {
+		d.Status = "approved"
+	}
+
+	res, err := db.Exec(`INSERT INTO expected_docs
+		(doc_id, title, category, publish_date, expected_url, file_sha256, file_size, version, status, publish_deadline, remark)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.DocID, d.Title, d.Category, d.PublishDate, d.ExpectedURL,
+		d.FileSHA256, d.FileSize, d.Version, d.Status, d.PublishDeadline, d.Remark)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	id, _ := res.LastInsertId()
+	d.ID = id
+	jsonResponse(w, d)
+}
+
+func handleUpdateExpectedDoc(w http.ResponseWriter, r *http.Request) {
+	var d ExpectedDoc
+	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		http.Error(w, "Invalid request body", 400)
+		return
+	}
+	if d.ID == 0 {
+		http.Error(w, "id is required", 400)
+		return
+	}
+
+	_, err := db.Exec(`UPDATE expected_docs SET
+		doc_id=?, title=?, category=?, publish_date=?, expected_url=?,
+		file_sha256=?, file_size=?, version=?, status=?, publish_deadline=?, remark=?,
+		updated_at=datetime('now')
+		WHERE id=?`,
+		d.DocID, d.Title, d.Category, d.PublishDate, d.ExpectedURL,
+		d.FileSHA256, d.FileSize, d.Version, d.Status, d.PublishDeadline, d.Remark, d.ID)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	jsonResponse(w, map[string]string{"status": "ok"})
+}
+
+func handleDeleteExpectedDoc(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", 400)
+		return
+	}
+	_, err := db.Exec("DELETE FROM expected_docs WHERE id=?", req.ID)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	jsonResponse(w, map[string]string{"status": "ok"})
+}
+
+func handleBatchCreateExpectedDocs(w http.ResponseWriter, r *http.Request) {
+	var docs []ExpectedDoc
+	if err := json.NewDecoder(r.Body).Decode(&docs); err != nil {
+		http.Error(w, "Invalid request body", 400)
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	stmt, err := tx.Prepare(`INSERT INTO expected_docs
+		(doc_id, title, category, publish_date, expected_url, file_sha256, file_size, version, status, publish_deadline, remark)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer stmt.Close()
+
+	inserted := 0
+	for _, d := range docs {
+		if d.Title == "" || d.Category == "" {
+			continue
+		}
+		if d.Status == "" {
+			d.Status = "approved"
+		}
+		_, err := stmt.Exec(d.DocID, d.Title, d.Category, d.PublishDate, d.ExpectedURL,
+			d.FileSHA256, d.FileSize, d.Version, d.Status, d.PublishDeadline, d.Remark)
+		if err != nil {
+			log.Printf("Batch insert error: %v", err)
+			continue
+		}
+		inserted++
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	jsonResponse(w, map[string]interface{}{"status": "ok", "inserted": inserted})
+}
+
 // ============== Main ==============
 
 func main() {
@@ -661,6 +852,11 @@ func main() {
 	mux.HandleFunc("/api/issues/resolve", corsMiddleware(handleResolveIssue))
 	mux.HandleFunc("/api/trigger", corsMiddleware(handleTriggerRun))
 	mux.HandleFunc("/api/categories", corsMiddleware(handleCategories))
+	mux.HandleFunc("/api/expected-docs", corsMiddleware(handleExpectedDocs))
+	mux.HandleFunc("/api/expected-docs/create", corsMiddleware(handleCreateExpectedDoc))
+	mux.HandleFunc("/api/expected-docs/update", corsMiddleware(handleUpdateExpectedDoc))
+	mux.HandleFunc("/api/expected-docs/delete", corsMiddleware(handleDeleteExpectedDoc))
+	mux.HandleFunc("/api/expected-docs/batch", corsMiddleware(handleBatchCreateExpectedDocs))
 
 	// Serve frontend static files
 	fs := http.FileServer(http.Dir("/app/static"))
