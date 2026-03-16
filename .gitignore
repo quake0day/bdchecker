@@ -1,0 +1,24 @@
+# Dependencies
+frontend/node_modules/
+frontend/build/
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Binary
+backend/inspector
+
+# Env
+.env
+*.tar.gz
